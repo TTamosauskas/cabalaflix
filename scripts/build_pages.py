@@ -1,8 +1,14 @@
 from pathlib import Path
+import json
+import urllib.request
+import xml.etree.ElementTree as ET
 
 SOURCE = Path("index.html")
 OUT_DIR = Path("_site")
 OUT = OUT_DIR / "index.html"
+CHANNEL_ID = "UCLoIrIrw3ekjA2xE5yh0leA"
+YOUTUBE_FEED = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
+LATEST_LIMIT = 15
 
 html = SOURCE.read_text(encoding="utf-8")
 
@@ -25,61 +31,58 @@ for old, new, label in replacements:
         raise SystemExit(f"Expected exactly one match for {label}, found {count}")
     html = html.replace(old, new, 1)
 
-latest_sync = r'''
-const LATEST_VIDEOS_CACHE_KEY="cabalaflix.latest-videos.v2";
-let latestVideosPromise=null;
-function mergeLatestVideos(items){
-  const incoming=(Array.isArray(items)?items:[]).map((v,index)=>({id:String(v?.id||"").trim(),title:String(v?.title||"").trim(),published:String(v?.published||""),index,channelTitle:CHANNEL.name})).filter(v=>v.id&&v.title);
-  if(!incoming.length)return false;
-  const freshIds=new Set(incoming.map(v=>v.id));
-  const merged=[...incoming,...CATALOG.filter(v=>!freshIds.has(v.id))];
-  CATALOG.splice(0,CATALOG.length,...merged);
-  CATALOG.forEach((v,index)=>v.index=index);
-  return true;
-}
-function hydrateLatestVideosCache(){
-  try{
-    const cached=JSON.parse(localStorage.getItem(LATEST_VIDEOS_CACHE_KEY)||"null");
-    if(!cached||!Array.isArray(cached.items)||Date.now()-Number(cached.savedAt||0)>7*24*60*60*1000)return false;
-    return mergeLatestVideos(cached.items);
-  }catch{return false}
-}
-function refreshLatestVideos(){
-  if(latestVideosPromise)return latestVideosPromise;
-  latestVideosPromise=(async()=>{
-    const root=window.CABALAFLIX_WP_REST_ROOT||"https://mortesubita.net/wp-json/";
-    const endpoint=new URL("msflix/v1/latest-videos",root).href;
-    const response=await fetch(endpoint,{cache:"no-store",credentials:"omit",headers:{Accept:"application/json"}});
-    const data=await response.json().catch(()=>({}));
-    if(!response.ok||data?.ok===false)throw new Error(String(data?.message||data?.error||`HTTP ${response.status}`));
-    if(!mergeLatestVideos(data?.items))throw new Error("A atualização não retornou vídeos");
-    try{localStorage.setItem(LATEST_VIDEOS_CACHE_KEY,JSON.stringify({savedAt:Date.now(),items:data.items}))}catch{}
-    if(pageMode==="home")renderHomeContent();
-    return true;
-  })().catch(e=>{console.warn("Latest videos",e);return false}).finally(()=>{latestVideosPromise=null});
-  return latestVideosPromise;
-}
-'''.strip()
 
-init_old = '''function init(){
-  els.topicBar.innerHTML=CATEGORY_DEFS.map(c=>`<button class="topic" data-category="${esc(c.name)}">${esc(c.name)}</button>`).join("");
-  renderHome();
-  requestAnimationFrame(fitSiteLink);
-}'''
-init_new = latest_sync + '''
-function init(){
-  els.topicBar.innerHTML=CATEGORY_DEFS.map(c=>`<button class="topic" data-category="${esc(c.name)}">${esc(c.name)}</button>`).join("");
-  hydrateLatestVideosCache();
-  renderHome();
-  refreshLatestVideos();
-  requestAnimationFrame(fitSiteLink);
-}'''
+def fetch_latest_videos():
+    request = urllib.request.Request(
+        YOUTUBE_FEED,
+        headers={
+            "User-Agent": "Mozilla/5.0 CabalaFlix-GitHub-Pages/1.0",
+            "Accept": "application/atom+xml,application/xml,text/xml,*/*",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = response.read()
 
-count = html.count(init_old)
-if count != 1:
-    raise SystemExit(f"Expected exactly one init block for latest-video sync, found {count}")
-html = html.replace(init_old, init_new, 1)
+    root = ET.fromstring(payload)
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+    }
+
+    videos = []
+    for entry in root.findall("atom:entry", ns):
+        video_id = (entry.findtext("yt:videoId", default="", namespaces=ns) or "").strip()
+        title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
+        if video_id and title:
+            videos.append([video_id, title])
+        if len(videos) >= LATEST_LIMIT:
+            break
+    return videos
+
+
+def merge_latest_into_catalog(page_html, latest):
+    prefix = "const RAW_CATALOG="
+    suffix = ";\nconst CATALOG=RAW_CATALOG.map"
+    start = page_html.index(prefix) + len(prefix)
+    end = page_html.index(suffix, start)
+
+    catalog = json.loads(page_html[start:end])
+    latest_ids = {item[0] for item in latest}
+    merged = latest + [item for item in catalog if item[0] not in latest_ids]
+    compact = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+    return page_html[:start] + compact + page_html[end:]
+
+
+try:
+    latest = fetch_latest_videos()
+    if latest:
+        html = merge_latest_into_catalog(html, latest)
+        print(f"YouTube feed synced: {len(latest)} recent videos; newest = {latest[0][1]} ({latest[0][0]})")
+    else:
+        print("YouTube feed returned no videos; keeping embedded RAW_CATALOG")
+except Exception as exc:
+    print(f"YouTube feed sync failed ({exc}); keeping embedded RAW_CATALOG")
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT.write_text(html, encoding="utf-8")
-print(f"Built {OUT} ({OUT.stat().st_size} bytes) with Chromecast diagnostics and automatic latest-video sync")
+print(f"Built {OUT} ({OUT.stat().st_size} bytes) with Chromecast diagnostics and refreshed Mais recentes")
